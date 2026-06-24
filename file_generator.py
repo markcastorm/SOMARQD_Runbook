@@ -133,7 +133,7 @@ def _cleanup_old_runs(keep=10):
 # Public API
 # ══════════════════════════════════════════════════════════════════════════════
 
-def generate_files(extraction_result):
+def generate_files(extraction_result, run_dir=None):
     """
     extraction_result: dict returned by extractor.extract()
     {
@@ -143,6 +143,7 @@ def generate_files(extraction_result):
         'period_label': str,
         'data': { code: value, ... }
     }
+    run_dir: optional path to the output run directory. If None, a new timestamped directory is created.
 
     Returns {'data_path': ..., 'meta_path': ..., 'zip_path': ...}
     """
@@ -188,8 +189,9 @@ def generate_files(extraction_result):
         run_data[next_period][code] = val if val is not None else config.NA_OUTPUT_VALUE
 
     # ── Write output files ────────────────────────────────────────────────────
-    run_stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_dir   = os.path.join(config.OUTPUT_DIR, run_stamp)
+    if run_dir is None:
+        run_stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        run_dir   = os.path.join(config.OUTPUT_DIR, run_stamp)
     os.makedirs(run_dir, exist_ok=True)
 
     data_path = _write_data(run_data, date_str, run_dir)
@@ -198,9 +200,7 @@ def generate_files(extraction_result):
 
     # ── Copy to latest/ ───────────────────────────────────────────────────────
     latest_dir = os.path.join(config.OUTPUT_DIR, 'latest')
-    if os.path.exists(latest_dir):
-        shutil.rmtree(latest_dir)
-    os.makedirs(latest_dir)
+    os.makedirs(latest_dir, exist_ok=True)
     for src in [data_path, meta_path, zip_path]:
         shutil.copy2(src, os.path.join(latest_dir, os.path.basename(src)))
 

@@ -1,6 +1,8 @@
 # SOMARQD Runbook Developer Documentation
 
-This document describes the design, execution commands, codebase structure, and key findings of the US Treasury Quarterly Refunding Estimates pipeline.
+This document describes the execution commands, codebase architecture, implementation details, and functional specifications of the US Treasury Quarterly Refunding Estimates pipeline.
+
+---
 
 ## Execution & Test Commands
 
@@ -8,7 +10,7 @@ This document describes the design, execution commands, codebase structure, and 
   ```bash
   python main.py
   ```
-  Runs the end-to-end flow: scrapes latest files, checks for new releases, extracts data, and generates output files.
+  Runs the end-to-end flow: scrapes latest files (Selenium stealth primary, requests backup), checks for new releases, extracts data, and generates output files.
 
 - **Run Extractor Tests**:
   ```bash
@@ -16,112 +18,176 @@ This document describes the design, execution commands, codebase structure, and 
   ```
   Tests the extraction logic on all sample PDFs inside the `Project_information/samplepdfs/` directory.
 
----
+- **Run Standalone Scraper Test**:
+  ```bash
+  python test_scraper_selenium.py
+  ```
+  Runs only the scraper flow in the Selenium stealth single-session mode to test browser initialization and native PDF downloading.
 
-## Codebase Architecture
-
-The project follows a standard SIMBA pipeline structure:
-
-1. **[config.py](file:///D:/Projects/SIMBA-RUNBOOKS/SOMARQD_Runbook/config.py)**: Configures download/output directories, target year/quarter selection (uses auto-detect if `None`), output column mapping (codes, descriptions, and Excel structure), and static metadata fields.
-2. **[scraper.py](file:///D:/Projects/SIMBA-RUNBOOKS/SOMARQD_Runbook/scraper.py)**: Scrapes the US Treasury archive. Tries direct requests first and falls back to Selenium stealth.
-   - Core function: `download()` -> downloads the target PDF.
-   - Correctly extracts page publication date avoiding sidebar elements.
-3. **[extractor.py](file:///D:/Projects/SIMBA-RUNBOOKS/SOMARQD_Runbook/extractor.py)**: Reads the PDF using PyMuPDF (`fitz`), groups words by horizontal position, finds column centers from the indices row `(1)` to `(7)`, parses data blocks per quarter period, and extracts estimated values.
-   - Core function: `extract()` -> extracts the 7 values.
-4. **[file_generator.py](file:///D:/Projects/SIMBA-RUNBOOKS/SOMARQD_Runbook/file_generator.py)**: Saves output files (DATA, META, ZIP) containing exactly 2 data rows representing the current release quarter and the next quarter. No historical master file is maintained.
-   - Core function: `generate_files(result)` -> returns generated file paths.
-5. **[orchestrator.py](file:///D:/Projects/SIMBA-RUNBOOKS/SOMARQD_Runbook/orchestrator.py)**: Wires together download, processed-check (tracks `processed.json`), extraction, and output generation.
-   - Core function: `main()`.
-6. **[main.py](file:///D:/Projects/SIMBA-RUNBOOKS/SOMARQD_Runbook/main.py)**: Entry point.
+- **Run Comprehensive Regression Suite**:
+  ```bash
+  python Project_information/test_all_pdfs_to_csv.py
+  ```
+  Extracts data from all 5 sample PDFs, compares results against manual reference values, and outputs a CSV log.
 
 ---
 
-## Key Solutions & Findings
+## Codebase Architecture & Function Reference
 
-### 1. Two-Row Output Design (Non-Incremental)
-As requested, the generated DATA xlsx file does not merge with any historical master file. It contains exactly two data rows representing the estimates of the current release:
-- **Current Quarter (Quarter of Release)**: e.g. `2026-Q1` with `QRELEASE` values filled and `QNEXT` values as blank.
-- **Next Quarter**: e.g. `2026-Q2` with `QNEXT` values filled and `QRELEASE` values as blank.
+The codebase consists of five main modules: `config.py`, `scraper.py`, `extractor.py`, `file_generator.py`, and `orchestrator.py`, tied together by `main.py`.
 
-### 2. Robust Block Year Extraction (Split-based)
-When parsing tables in historical or Q1 PDFs (e.g. `2026 Q1`), we found that the announcement dates (like `November 3, 2025` for the `Jan - Mar 2026` block) were grouped into the same row as the quarter range (`Jan - Mar November 3, 2025`). In this case, `re.search` matched `2025` instead of `2026` as the block year.
+### 1. config.py (Configuration Schema)
+Defines environment variables, output mappings, and target periods. It contains no functions. Key configurations:
+* `COLUMNS`: Dict list defining the absolute code column order, descriptions, mapping positions, and row target types (e.g. `QRELEASE` vs `QNEXT`).
+* `META_STATIC`: Static schema keys populated in the metadata output sheets.
 
-To solve this, we implemented `_get_quarter_column_text()`:
-- It splits the row text by the `DATE_PATTERN` or keywords like `Actual` or `Revisions` and only looks for the block year in the left-hand portion of the text (representing the `Quarter` column).
-- This approach is entirely layout-independent, meaning shifts in margins or coordinates (like in May 2026 where column `Quarter` moved to `x0 = 85.44`) do not break parsing.
+---
 
-### 3. Robust Page Date Extraction
-The press release pages contain multiple `<time>` elements (such as sidebar lists with class `.mm-news-row`).
-We updated `_extract_page_date()` in [scraper.py](file:///D:/Projects/SIMBA-RUNBOOKS/SOMARQD_Runbook/scraper.py) to target the specific container class `.field--name-field-news-publication-date` which holds the actual publication date (e.g. `2026-05-04`), preventing incorrect cache checks.
+### 2. scraper.py (Scraping and File Download)
+Handles page navigation, target quarter resolution, native browser click tracking, and legacy PDF wrapper redirections.
 
-### 4. Change in Cash Balance Value Difference
-In `Sources-Uses-Table-May2026.pdf` (for `2026-Q2` release):
-- Marketable Borrowing = `189.0`
-- End of Quarter Cash Balance = `900.0`
-- Change in Cash Balance = `7.0` (latest estimate on row May 4, 2026)
-- SOMA Redemptions = `0.0`
+#### `_get_chrome_version()`
+* **Purpose**: Detects the installed Google Chrome browser major version to align chromedriver versions and prevent startup crashes.
+* **Logic**: On Windows, reads `winreg` keys under `HKCU` or `HKLM` (specifically `Software\Google\Chrome\BLBeacon\version`). On Linux, executes shell commands (`google-chrome --version` etc.) and parses the stdout string.
 
-*Note:* The reference CSV contained `-43.0` for Change in Cash Balance. This `-43` is the revision delta (difference between the February and May estimates), whereas the pipeline extracts the actual latest estimate (`7.0`) which is correct.
+#### `_make_run_dir(year, quarter)`
+* **Purpose**: Creates a timestamped local download subfolder for target PDFs.
+* **Returns**: Absolute path string `downloads/<timestamp>/<year>/Q<quarter>/`.
 
-### 5. CRITICAL FIX (2026-06-24): Dynamic Column Tolerance & Merged-Row Year Bug
+#### `_parse_archive_html(html)`
+* **Purpose**: Parses the HTML of the main archives page to build a structured database of active releases.
+* **Logic**: Uses `BeautifulSoup` to scan the grid table. Locates rows with year ID headers (`<th id="YYYY">`) followed by quarter headers (`<th headers="YYYY">`). Extracts `href` links for cells that contain active `<a>` tags.
+* **Returns**: Dict mapping `year (int) -> { quarter_num (int): url_or_None }`.
 
-**Problem:** The extractor worked for 2026 PDFs but failed for older PDFs (e.g. 2025 Q4, Q3, Q2):
-- `SOMARQD.CHANGEINCASHBALANCE.QNEXT.Q` returned `None` instead of `0.0`
-- `SOMARQD.CHANGEINCASHBALANCE.QRELEASE.Q` returned `None` for some PDFs
-- For Feb 2026 (Q1), the `jan - mar` target block was `NOT FOUND`
+#### `_get_targets(available)`
+* **Purpose**: Resolves the list of targets to process based on user configurations.
+* **Logic**: 
+  * If `TARGET_YEAR` and `TARGET_QUARTER` are `None`: Finds the single newest year and quarter containing a clickable link (Auto-detect mode).
+  * If `TARGET_YEAR` is set but `TARGET_QUARTER` is `None`: Returns a chronological list of **all active quarters** for that year (Multi-Quarter Loop).
+  * If both are specified: Returns a list containing that single target.
+* **Returns**: List of `(year, quarter, url)` tuples.
 
-**Root Cause 1 — Fixed COL_TOLERANCE too tight:**
-The extractor used a hardcoded `COL_TOLERANCE = 18 pts` for column matching.
-Different PDF vintages use different page widths (compact ~560pt vs wide ~700pt),
-causing `0` values and some numeric values to render at x-offsets of 19.9–25.5 pts
-from their column center — just outside the 18 pt window.
+#### `_extract_page_date(html)`
+* **Purpose**: Parses the publication date of the press release.
+* **Logic**: Searches for a `<time datetime="...">` tag specifically inside the news container `.field--name-field-news-publication-date` (avoiding sidebar news feeds). Falls back to general regex date matching (e.g., `May 4, 2026`).
+* **Returns**: Date string in `YYYYMMDD` format.
 
-**Root Cause 2 — Formula row skews min_gap:**
-The header row contains `(4) = (2) + (3)` which places cols 3 and 4 close together
-(min gap ≈29-46 pts). Using `min_gap × 0.40` as tolerance was too small.
+#### `_find_sources_uses_link(html, page_url)`
+* **Purpose**: Locates the "Sources and Uses Table" PDF link on the press-release page.
+* **Logic**: Searches tags `<a>` for keyword fragments (`sources and uses table`, `here`, etc.) or for href values containing `sources` and `uses` ending in `.pdf`.
 
-**Fix — Dynamic tolerance based on MEDIAN column gap:**
-```python
-def _compute_col_tolerance(col_centers):
-    xs = sorted(col_centers.values())
-    gaps = [xs[i+1] - xs[i] for i in range(len(xs)-1)]
-    median_gap = statistics.median(gaps)   # unaffected by formula col compression
-    tol = min(median_gap * 0.45, 35.0)    # 45% of median, max 35 pts
-    tol = max(tol, 12.0)                  # never below 12 pts
-    return tol
-```
-Typical effective tolerances: 21-33 pts depending on PDF layout.
+#### `_wait_for_download(download_dir, timeout=45)`
+* **Purpose**: Polls a download directory until a native Chrome PDF download finishes writing.
+* **Logic**: Iterates over directory contents. Finds files ending in `.pdf` (excluding temporary `.crdownload` or `.tmp` extensions). Verifies that the file size has stabilized (remains identical after a 1.5-second sleep).
+* **Returns**: Absolute path to the downloaded PDF file.
 
-**Root Cause 3 — Merged-row year detection bug (Feb 2026 Q1 PDF):**
-In the Feb 2026 PDF, the `Jan - Mar` period row was merged with the November 3 estimate:
-`Jan - Mar  November 3, 2025  511  578  (67)  511  0  850  0`
-The code incorrectly set `block['year'] = 2025` from the announcement date.
-The actual year `2026` was on the NEXT row: `2026  February 2, 2026  530...`
+#### `_requests_session()`
+* **Purpose**: Creates a pre-configured `requests.Session` populated with real-browser user agent headers.
 
-**Fix:** Removed year-from-date logic from merged-row detection.
-Year is ONLY set from the quarter-column text portion (before the date),
-OR from a standalone year-number row that follows the period label row.
+#### `_download_pdf_via_requests(url, dest_path, cookies=None)`
+* **Purpose**: Downloads a PDF directly via requests (used in backup strategies or cookie failovers).
+* **Logic**: Calls `requests.get` with optional cookie parameters, checks content headers to ensure it is not an HTML error page, writes chunks, and verifies file size.
 
-**Root Cause 4 — Merged period+data rows (Jul 2025 style):**
-July 2025 PDF packs the period label AND first estimate AND values all on one row:
-`Jul - Sep  April 28, 2025  480  554  (75)  480  0  850  (15)`
-The previous parser skipped the data values on period-label rows entirely.
+#### `_extract_link_from_wrapper_pdf(pdf_path)`
+* **Purpose**: Extracts target PDF URLs embedded inside legacy wrapper PDFs.
+* **Logic**: Opens the PDF via `fitz`, reads the annotations (`/Annots`) of all pages, and checks for `LINK_URI` annotations containing URL string pointers.
 
-**Fix:** Added merged-row detection: if a period-label row also contains numeric
-column values (via `_classify_row()`), the entry is captured and appended to
-the new block's entries.
+#### `_handle_legacy_pdf_link(pdf_url, year, quarter, session, cookies=None)`
+* **Purpose**: Downloads direct PDF wrapper links (e.g. 2015 Q3) and replaces them with their embedded target PDFs.
+* **Logic**: Downloads the wrapper, extracts its annotations, triggers browser download or requests download of the real table PDF, overwrites the wrapper, and returns metadata.
 
-**Test Results After Fix — ALL 5 PDFs PASS (35/35 fields):**
-| PDF | SOMA | MB.QREL | MB.QNXT | CCB.QREL | CCB.QNXT | EOQ.QREL | EOQ.QNXT |
-|-----|------|---------|---------|----------|----------|----------|----------|
-| May 2026 Q2 | 0 | 189 | 671 | 7 | 50 | 900 | 950 |
-| Feb 2026 Q1 | 0 | 574 | 109 | -23 | 50 | 850 | 900 |
-| Nov 2025 Q4 | -10 | 569 | 578 | -41 | **0** | 850 | 850 |
-| Jul 2025 Q3 | -15 | 1007 | 590 | 393 | **0** | 850 | 850 |
-| Apr 2025 Q2 | -15 | 514 | 554 | 444 | **0** | 850 | 850 |
+#### `try_direct_download(targets)`
+* **Purpose**: Backup strategy to download targets directly using `requests` if Selenium fails.
 
-The bolded **0** values were previously extracted as `None`.
+#### `_build_selenium_driver()`
+* **Purpose**: Boots up an undetected Chrome session with stealth options.
+* **Logic**: Configures options (headless mode, GPU disables, user agent, language), sets Chrome preferences to force PDFs to open externally (triggering download), starts `uc.Chrome(...)` passing `version_main`, and applies `selenium_stealth` patches.
 
-**Test scripts:**
-- `test_extraction.py` — original test with reference comparison for May 2026
-- `test_all_pdfs_to_csv.py` — comprehensive test of ALL 5 sample PDFs with full reference expected values and CSV output to `Project_information/extraction_test_results.csv`
+#### `download()`
+* **Purpose**: Primary orchestrator for the download phase.
+* **Logic**:
+  1. Boots a **single browser session** using `_build_selenium_driver()`.
+  2. Visits the archive page, extracts target items, and loops through them.
+  3. Updates the browser's download directory via CDP (`Page.setDownloadBehavior`) for each target.
+  4. Scrolls to cells and clicks natively via JS (`arguments[0].click()`).
+  5. Scrolls and clicks the PDF link on the press release natively, then executes `_wait_for_download()`.
+  6. Falls back to requests + cookies if native download fails, and falls back to direct requests entirely if the browser crashes or fails to initialize on startup.
+
+---
+
+### 3. extractor.py (Data Extraction Engine)
+Reads the downloaded PDF, parses the structured grid coordinates, maps columns, and extracts values.
+
+#### `_clean_number(raw)`
+* **Purpose**: Standardizes PDF text cells into floats (e.g. `(45)` -> `-45.0`, `1,250` -> `1250.0`).
+
+#### `_get_words(page)`
+* **Purpose**: Parses PyMuPDF `words` layouts. Returns list of `(x0, y0, text)` items.
+
+#### `_group_into_rows(words, row_gap=3.5)`
+* **Purpose**: Groups text blocks into horizontal table rows.
+* **Logic**: Sorts word tokens by y-coordinate. Groups tokens whose y-coordinates are within `row_gap` points of each other.
+
+#### `_find_column_centers(rows)`
+* **Purpose**: Detects the absolute x-coordinates of table columns dynamically.
+* **Logic**: Scans rows to find the index row `(1) (2) (3) ... (7)`. Captures the first occurrences of these values to define column centers, falling back to empirical defaults if not found.
+
+#### `_compute_col_tolerance(col_centers)`
+* **Purpose**: Computes layout-adaptive tolerances for column coordinates.
+* **Logic**: Computes adjacent column gaps. Calculates `median_adjacent_gap * 0.45` (floored at 12pts and capped at 35pts).
+
+#### `_get_col_value(row, col_centers, col_num, tol)`
+* **Purpose**: Fetches the numerical value belonging to column `col_num` from a row.
+* **Logic**: Loops through row tokens, calculates distance to column center, and selects the closest token within tolerance `tol`.
+
+#### `_get_quarter_column_text(text)`
+* **Purpose**: Isolates the quarter label portion of a row, removing dates or Actual flags.
+* **Logic**: Splits the row text using the `DATE_PATTERN` or keywords like `Actual`/`Revisions` to prevent parsing merged year tags incorrectly.
+
+#### `_classify_row(text, vals)`
+* **Purpose**: Classifies a row into an estimate category (e.g., `AnnDate`, `Actual`, `Revisions`).
+
+#### `_parse_pdf_table(rows, col_centers, tol)`
+* **Purpose**: Parses rows into chronological year-quarter blocks.
+* **Logic**: Uses a state-machine that registers period changes (e.g. `Apr - Jun`), captures block years, parses merged lines (e.g., Jul 2025 where period and values are single-row), and collects entries.
+
+#### `_pick_estimate_row(block, is_quarter_of_release)`
+* **Purpose**: Selects the target row in a block. Picks the latest `AnnDate` (highest date string) or falls back to `Actual`.
+
+#### `extract(pdf_path, year, quarter, period_label, date_str)`
+* **Purpose**: Runs the full extraction sequence, resolving target and next-quarter data blocks and returning a mapped dict of the 7 target keys.
+
+---
+
+### 4. file_generator.py (File Writer)
+Generates the XLSX database worksheets, metadata sheets, ZIP compression bundles, and executes run folder cleanup.
+
+#### `_write_data(data_dict, date_str, run_dir)`
+* **Purpose**: Writes the DATA Excel sheet.
+* **Logic**: Populates code headers in row 0, descriptions in row 1, and inserts sorted Release Quarter and Next Quarter rows.
+
+#### `_write_meta(date_str, run_dir)`
+* **Purpose**: Writes the META Excel sheet schema.
+
+#### `_write_zip(date_str, run_dir, files)`
+* **Purpose**: Bundles generated Excel files into a zip archive.
+
+#### `_cleanup_old_runs(keep=10)`
+* **Purpose**: Keeps only the 10 most recent historic folders under `output/`.
+
+#### `generate_files(extraction_result, run_dir=None)`
+* **Purpose**: Maps results into the two release-estimates rows, saves output files, copies them to the `latest/` directory, and performs cleanups.
+
+---
+
+### 5. orchestrator.py (Pipeline Execution Core)
+Coordinates database state caches, schedules download targets, and triggers extraction loops.
+
+#### `_load_processed()`
+* **Purpose**: Reads `processed.json` to load the database of already completed releases.
+
+#### `_mark_processed(key)`
+* **Purpose**: Appends a completed run key (`{year}-Q{quarter}_{date_str}`) to `processed.json`.
+
+#### `main()`
+* **Purpose**: End-to-end pipeline manager. Runs the scraper, filters out previously completed targets, clears `latest/` once, loops through new targets to extract data, writes outputs, and logs cache entries.
